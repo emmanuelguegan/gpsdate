@@ -8,9 +8,14 @@ The program waits for a specified maximum time until a valid [`$GPRMC`][1] NMEA
 sentence is received. If the GPS receiver is not fixed and no valid time
 information is received, the local time remains unchanged.
 
+This version is a fork from https://github.com/adamheinrich/gpsdate attended to 
+correct week rollover GPS issue.
+
+See : https://en.wikipedia.org/wiki/GPS_week_number_rollover
+
 # Building
 
-	git clone https://github.com/adamheinrich/gpsdate # Or download as zip
+	git clone https://github.com/emmanuelguegan/gpsdate # Or download as zip
 	cd gpsdate
 	make
 
@@ -34,9 +39,9 @@ Then check if it sends back NMEA sentences, e.g. using `cat`:
 Now you can `gpsdate` to change local time:
 
 	# ./gpsdate /dev/ttyACM0
-	Local time was: 2014-03-16 20:19:06 (CET)
-	GPS   time  is: 2014-03-16 19:19:07 (UTC)
-	Successfully updated local time.
+	Local time was: 2022-02-15 16:55:45 (GMT)
+	GPS   time  is: 2022-02-15 16:55:45 (GMT)
+	Adjtime : Successfully updated local time.
 
 Note that changing time requires root privileges. To achieve this, run:
 
@@ -56,6 +61,9 @@ Options:
   -t,-d <timeout>  Sets the maximum timeout in seconds or 0 for no timeout
                    (Default 10 seconds)
   -h               Displays this help.
+  -r               Correct GPS week number rollover
+  -n               Dry run , Get the GPS time but don't apply it
+
 ```
 
 # License
