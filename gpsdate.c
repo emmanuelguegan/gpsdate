@@ -18,21 +18,30 @@
  */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <signal.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/time.h>	
+#include <math.h>
+
 #include "nmea.h"
 #include "serial_port.h"
 
 #define DEFAULT_BAUDRATE	9600
 #define DEFAULT_TIMEOUT		10
+/* the correcti is 1024 weeks : 1024*7*24*3600 */
+#define ROLLOVER_CORRECTION	619315200
 
 #define TIME_FMT		"%04d-%02d-%02d %02d:%02d:%02d"
 
 static volatile bool read_gps = true;
 static bool date_changed;
+
+static bool opt_correct_rollover = false;
+static bool opt_dry_run = false;
 
 static const char *help_text =
 "Sets time from a GPS receiver connected to a serial port as a local time.\n\n"
@@ -41,7 +50,52 @@ static const char *help_text =
 "                   4800, ..., 230400} is supported (Default %d baud).\n"
 "  -t,-d <timeout>  Sets the maximum timeout in seconds or 0 for no timeout\n"
 "                   (Default %d seconds)\n"
-"  -h               Displays this help.\n";
+"  -h               Displays this help.\n"
+"  -r               Correct GPS week number rollover\n"
+"  -n               Dry run , Get the GPS time but don\'t apply it\n";
+
+
+/* Subtract the ‘struct timeval’ values X and Y,
+   storing the result in RESULT.
+   Return 1 if the difference is negative, otherwise 0. */
+
+int timeval_subtract (struct timeval *result, struct timeval *x, struct timeval *y)
+{
+  /* Perform the carry for the later subtraction by updating y. */
+  if (x->tv_usec < y->tv_usec) {
+    long int nsec = (y->tv_usec - x->tv_usec) / 1000000 + 1;
+    y->tv_usec -= 1000000 * nsec;
+    y->tv_sec += nsec;
+  }
+  if (x->tv_usec - y->tv_usec > 1000000) {
+    long int nsec = (x->tv_usec - y->tv_usec) / 1000000;
+    y->tv_usec += 1000000 * nsec;
+    y->tv_sec -= nsec;
+  }
+
+  /* Compute the time remaining to wait.
+     tv_usec is certainly positive. */
+  result->tv_sec = x->tv_sec - y->tv_sec;
+  result->tv_usec = x->tv_usec - y->tv_usec;
+
+  /* Return 1 if result is negative. */
+  return (x->tv_sec < y->tv_sec);
+}
+
+long int timeval_diffabs( struct timeval *x, struct timeval *y)
+{
+	struct timeval result;
+	result.tv_usec=0;
+
+	if ( x->tv_sec < y->tv_sec ) {
+		result.tv_sec= y->tv_sec  - x->tv_sec ;
+	}	
+	else {
+		result.tv_sec = x->tv_sec - y->tv_sec ;
+	}
+	return result.tv_sec;
+
+}
 
 static void print_help(bool full_help, const char *program_name)
 {
@@ -57,6 +111,13 @@ static void print_help(bool full_help, const char *program_name)
 static void process_message(const char *msgid, const char **data)
 {
 	size_t length = 0;
+	time_t rollover_correction = (time_t)0;
+	struct	timeval sys_timev, 
+			gps_timev, 
+			delta_timev;
+
+	if ( opt_correct_rollover == true ) rollover_correction = (time_t)ROLLOVER_CORRECTION;
+
 	while (data[length])
 		length++;
 
@@ -86,15 +147,17 @@ static void process_message(const char *msgid, const char **data)
 		    (seconds >= 0 && seconds <= 59)) {
 
 			/* Get current time, print it and modify: */
-			time_t curr_time;
-			time(&curr_time);
-			struct tm *t = localtime(&curr_time);
+			
+			gettimeofday(&sys_timev, 0);
+
+			struct tm *t = gmtime(&sys_timev.tv_sec);
 
 			printf("Local time was: " TIME_FMT " (%s)\n",
 			       (t->tm_year + 1900), (t->tm_mon + 1), t->tm_mday,
 			       t->tm_hour, t->tm_min, t->tm_sec, t->tm_zone);
-			printf("GPS   time  is: " TIME_FMT " (UTC)\n",
-			       year, month, day, hours, minutes, seconds);
+			printf("GPS   time  is: " TIME_FMT " (%s)\n",
+			       year, month, day, hours, minutes, seconds, t->tm_zone);
+
 
 			t->tm_year = year - 1900;
 			t->tm_mon = month - 1;
@@ -104,15 +167,47 @@ static void process_message(const char *msgid, const char **data)
 			t->tm_sec = seconds;
 
 			/* Set new system time: */
-			time_t gps_time = mktime(t);
-			gps_time += t->tm_gmtoff;
+			gps_timev.tv_sec = timegm(t);
 
-			if (stime(&gps_time) == 0) {
-				printf("Successfully updated local time.\n");
-				date_changed = true;
-			} else {
-				fprintf(stderr, "Couldn't set local time. "
-					"Do you have root privileges?\n");
+			gps_timev.tv_sec+=rollover_correction;
+			gps_timev.tv_usec=(long int)  0;
+
+			if ( opt_correct_rollover == true )  {
+
+				struct tm *new_t = gmtime(&gps_timev.tv_sec);
+				printf("1024 weeks Corrected time is: " TIME_FMT " (%s)\n",
+                        	       (new_t->tm_year + 1900), (new_t->tm_mon + 1), new_t->tm_mday,
+	                               new_t->tm_hour, new_t->tm_min, new_t->tm_sec, new_t->tm_zone);
+			}
+			if ( opt_dry_run == false ) {
+				timeval_subtract(&delta_timev,&gps_timev,&sys_timev);
+				if ( timeval_diffabs(&sys_timev,&gps_timev)  < 60 ) {
+					printf("Adjtime : ");
+					if (adjtime(&delta_timev,NULL) == 0 )  {
+                                                printf("Successfully updated local time.\n");
+                                                date_changed = true;
+                                        } else {
+                                                fprintf(stderr, "Couldn't set local time. "
+                                                        "Do you have root privileges?\n");
+                                        }
+
+						
+				}
+				else
+				{
+					printf("settime : ");	
+					if (stime(&gps_timev.tv_sec) == 0) {
+						printf("Successfully updated local time.\n");
+						date_changed = true;
+					} else {
+						fprintf(stderr, "Couldn't set local time. "
+							"Do you have root privileges?\n");
+					}	
+				}
+			}
+			else	
+			{
+				 printf("Dry run : Time no set\n");
 			}
 
 			read_gps = false;
@@ -133,7 +228,7 @@ int main(int argc, char **argv)
 
 	/* Handle options: */
 	int c;
-	while ((c = getopt(argc, argv, "hb:d:t:")) != -1) {
+	while ((c = getopt(argc, argv, "hrnb:d:t:")) != -1) {
 		switch (c) {
 		case 'b':
 			sscanf(optarg, "%d", &baudrate);
@@ -142,6 +237,12 @@ int main(int argc, char **argv)
 		case 'd': /* For backward compatibility ("delay"): */
 			sscanf(optarg, "%d", &timeout);
 			break;
+		case 'r':
+			opt_correct_rollover = true;
+			break;
+                case 'n':
+                        opt_dry_run = true;
+                        break;
 		case 'h':
 			print_help(true, argv[0]);
 			return 0;
