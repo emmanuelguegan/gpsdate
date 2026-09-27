@@ -22,9 +22,12 @@
 #include <stdbool.h>
 #include <signal.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
 #include <unistd.h>
-#include <sys/time.h>	
+#include <errno.h>
+#include <poll.h>
+#include <sys/time.h>
 #include <math.h>
 
 #include "nmea.h"
@@ -32,10 +35,14 @@
 
 #define DEFAULT_BAUDRATE	9600
 #define DEFAULT_TIMEOUT		10
+#define POLL_INTERVAL_MS	1000
 /* the correcti is 1024 weeks : 1024*7*24*3600 */
 #define ROLLOVER_CORRECTION	619315200
+/* adjtime() slews the clock at only ~0.5 ms per second (1 s takes ~33 min),
+   so larger offsets are stepped with settimeofday() instead: */
+#define MAX_SLEW_USEC		1000000LL
 
-#define TIME_FMT		"%04d-%02d-%02d %02d:%02d:%02d"
+#define TIME_FMT		"%04d-%02d-%02d %02d:%02d:%02d.%03ld"
 
 static volatile bool read_gps = true;
 static bool date_changed;
@@ -47,7 +54,7 @@ static const char *help_text =
 "Sets time from a GPS receiver connected to a serial port as a local time.\n\n"
 "Options:\n"
 "  -b <baudrate>    Sets baud rate. Only a limited set of baud rates {2400,\n"
-"                   4800, ..., 230400} is supported (Default %d baud).\n"
+"                   4800, ..., 921600} is supported (Default %d baud).\n"
 "  -t,-d <timeout>  Sets the maximum timeout in seconds or 0 for no timeout\n"
 "                   (Default %d seconds)\n"
 "  -h               Displays this help.\n"
@@ -82,19 +89,26 @@ int timeval_subtract (struct timeval *result, struct timeval *x, struct timeval 
   return (x->tv_sec < y->tv_sec);
 }
 
-long int timeval_diffabs( struct timeval *x, struct timeval *y)
+/* Converts an optional ".ddd..." suffix to microseconds (digits beyond 6 are
+   ignored). Returns 0 when there is no fraction, -1 when it is malformed. */
+static long parse_fraction_usec(const char *s)
 {
-	struct timeval result;
-	result.tv_usec=0;
+	long usec = 0;
+	long scale = 100000;
 
-	if ( x->tv_sec < y->tv_sec ) {
-		result.tv_sec= y->tv_sec  - x->tv_sec ;
-	}	
-	else {
-		result.tv_sec = x->tv_sec - y->tv_sec ;
+	if (*s == '\0')
+		return 0;
+	if (*s++ != '.')
+		return -1;
+
+	for (; *s; s++) {
+		if (!isdigit((unsigned char)*s))
+			return -1;
+		usec += (*s - '0') * scale;
+		scale /= 10;
 	}
-	return result.tv_sec;
 
+	return usec;
 }
 
 static void print_help(bool full_help, const char *program_name)
@@ -121,17 +135,27 @@ static void process_message(const char *msgid, const char **data)
 	while (data[length])
 		length++;
 
-	if (strcmp(msgid, "GPRMC") == 0 && (length == 11 || length == 12)) {
+	/* Accept RMC from any talker (GPRMC, GNRMC, GLRMC, ...). Field count
+	   is 11 before NMEA 2.3, 12 with mode (2.3), 13 with nav status (4.1): */
+	if (strlen(msgid) == 5 && strcmp(msgid + 2, "RMC") == 0 &&
+	    length >= 11 && length <= 13) {
 
 		/* Only parse time when there is a fix: */
 		if (strcmp(data[1], "A") != 0)
 			return;
 
-		/* Parse UTC time: */
+		/* Parse UTC time (hhmmss[.sss]): */
 		int day, month, year, hours, minutes, seconds;
+		int consumed = 0;
+		long usec;
 		const char *tfmt = "%02d%02d%02d";
 
-		if (sscanf(data[0], tfmt, &hours, &minutes, &seconds) != 3)
+		if (sscanf(data[0], "%02d%02d%02d%n", &hours, &minutes, &seconds,
+			   &consumed) != 3 || consumed != 6)
+			return;
+
+		usec = parse_fraction_usec(data[0] + consumed);
+		if (usec < 0)
 			return;
 
 		if (sscanf(data[8], tfmt, &day, &month, &year) != 3)
@@ -154,9 +178,11 @@ static void process_message(const char *msgid, const char **data)
 
 			printf("Local time was: " TIME_FMT " (%s)\n",
 			       (t->tm_year + 1900), (t->tm_mon + 1), t->tm_mday,
-			       t->tm_hour, t->tm_min, t->tm_sec, t->tm_zone);
+			       t->tm_hour, t->tm_min, t->tm_sec,
+			       (long)sys_timev.tv_usec / 1000, t->tm_zone);
 			printf("GPS   time  is: " TIME_FMT " (%s)\n",
-			       year, month, day, hours, minutes, seconds, t->tm_zone);
+			       year, month, day, hours, minutes, seconds,
+			       usec / 1000, t->tm_zone);
 
 
 			t->tm_year = year - 1900;
@@ -170,19 +196,23 @@ static void process_message(const char *msgid, const char **data)
 			gps_timev.tv_sec = timegm(t);
 
 			gps_timev.tv_sec+=rollover_correction;
-			gps_timev.tv_usec=(long int)  0;
+			gps_timev.tv_usec = usec;
 
 			if ( opt_correct_rollover == true )  {
 
 				struct tm *new_t = gmtime(&gps_timev.tv_sec);
 				printf("1024 weeks Corrected time is: " TIME_FMT " (%s)\n",
                         	       (new_t->tm_year + 1900), (new_t->tm_mon + 1), new_t->tm_mday,
-	                               new_t->tm_hour, new_t->tm_min, new_t->tm_sec, new_t->tm_zone);
+	                               new_t->tm_hour, new_t->tm_min, new_t->tm_sec,
+				       usec / 1000, new_t->tm_zone);
 			}
 			if ( opt_dry_run == false ) {
 				timeval_subtract(&delta_timev,&gps_timev,&sys_timev);
-				if ( timeval_diffabs(&sys_timev,&gps_timev)  < 60 ) {
-					printf("Adjtime : ");
+				long long delta_usec = (long long)delta_timev.tv_sec * 1000000LL +
+						       delta_timev.tv_usec;
+				if (llabs(delta_usec) < MAX_SLEW_USEC) {
+					printf("Adjtime (slewing by %+.3f s) : ",
+					       (double)delta_usec / 1e6);
 					if (adjtime(&delta_timev,NULL) == 0 )  {
                                                 printf("Successfully updated local time.\n");
                                                 date_changed = true;
@@ -195,8 +225,8 @@ static void process_message(const char *msgid, const char **data)
 				}
 				else
 				{
-					printf("settime : ");	
-					if (stime(&gps_timev.tv_sec) == 0) {
+					printf("settime : ");
+					if (settimeofday(&gps_timev, NULL) == 0) {
 						printf("Successfully updated local time.\n");
 						date_changed = true;
 					} else {
@@ -273,7 +303,10 @@ int main(int argc, char **argv)
 	time_t start_time, curr_time;
 	time(&start_time);
 
-	char buffer[64];
+	/* Read everything available as soon as it arrives, so no backlog
+	   builds up at high update rates and the parsed time is fresh: */
+	char buffer[4096];
+	struct pollfd pfd = { .fd = fd, .events = POLLIN };
 
 	while (read_gps) {
 		time(&curr_time);
@@ -283,11 +316,22 @@ int main(int argc, char **argv)
 			break;
 		}
 
-		ssize_t nread = read(fd, buffer, sizeof(buffer));
-		if (nread > 0)
-			nmea_parse(buffer, (size_t)nread, &process_message);
+		/* Wake up at least once a second to check the timeout: */
+		int ready = poll(&pfd, 1, POLL_INTERVAL_MS);
+		if (ready < 0 && errno != EINTR) {
+			perror("poll");
+			break;
+		}
+		if (ready <= 0)
+			continue;
 
-		usleep(100000);
+		ssize_t nread = read(fd, buffer, sizeof(buffer));
+		if (nread > 0) {
+			nmea_parse(buffer, (size_t)nread, &process_message);
+		} else if (nread == 0 || (errno != EAGAIN && errno != EINTR)) {
+			fprintf(stderr, "Lost connection to %s\n", port_name);
+			break;
+		}
 	}
 
 	close(fd);

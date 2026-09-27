@@ -57,7 +57,7 @@ Sets time from a GPS receiver connected to a serial port as a local time.
 
 Options:
   -b <baudrate>    Sets baud rate. Only a limited set of baud rates {2400,
-                   4800, ..., 230400} is supported (Default 9600 baud).
+                   4800, ..., 921600} is supported (Default 9600 baud).
   -t,-d <timeout>  Sets the maximum timeout in seconds or 0 for no timeout
                    (Default 10 seconds)
   -h               Displays this help.

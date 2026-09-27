@@ -40,6 +40,14 @@ static speed_t baudval(int baudrate)
 		return B115200;
 	case 230400:
 		return B230400;
+#ifdef B460800
+	case 460800:
+		return B460800;
+#endif
+#ifdef B921600
+	case 921600:
+		return B921600;
+#endif
 	default:
 		return B0;
 	}
@@ -59,16 +67,18 @@ int serial_port_open(const char *port_name, int baudrate)
 		/* 8N1, ignore modem lines, receive: */
 		.c_cflag = (CS8 | CLOCAL | CREAD),
 
-		/* Ignore parity errors, raw output, canonical input: */
+		/* Ignore parity errors, raw output, raw input. Raw rather than
+		   canonical input so one read() returns all buffered bytes
+		   instead of a single line (the NMEA parser handles split
+		   sentences): */
 		.c_iflag = IGNPAR,
 		.c_oflag = 0,
-		.c_lflag = ICANON,
+		.c_lflag = 0,
 
-		/* A read() is satisfied when either VMIN characters have been
-		   transferred to the caller's buffer, or when VTIME (in tenths
-		   of second) expires between characters: */
+		/* The fd is non-blocking and waited on with poll(), so a
+		   read() returns whatever is available: */
 		.c_cc[VMIN] = 1,
-		.c_cc[VTIME] = 5,
+		.c_cc[VTIME] = 0,
 	};
 
 	tcflush(fd, TCIFLUSH);

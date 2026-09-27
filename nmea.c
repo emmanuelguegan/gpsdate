@@ -33,7 +33,8 @@ static size_t tokens_length;
 static int checksum;
 static bool checksum_process;
 
-static bool buffer_full;
+/* Discard input until the next '$' (at startup, after a sentence ends, or on overflow): */
+static bool wait_for_start = true;
 
 static void reset_parser(void)
 {
@@ -46,7 +47,7 @@ static void reset_parser(void)
 	checksum = 0;
 	checksum_process = false;
 
-	buffer_full = false;
+	wait_for_start = false;
 }
 
 void nmea_parse(const char *buffer, size_t buffer_size,
@@ -58,8 +59,10 @@ void nmea_parse(const char *buffer, size_t buffer_size,
 	if (!buffer || !callback)
 		return;
 
-	while (buffer_size > 0 && *buffer) {
-		if (buffer_full && *buffer != '$')
+	/* A for loop (not while) so that `continue` still advances to the next
+	   byte; skipping the increment would loop forever on the same byte: */
+	for (; buffer_size > 0 && *buffer; buffer++, buffer_size--) {
+		if (wait_for_start && *buffer != '$')
 			continue;
 
 		switch (*buffer) {
@@ -85,29 +88,35 @@ void nmea_parse(const char *buffer, size_t buffer_size,
 				}
 
 				reset_parser();
+				wait_for_start = true;
 				break;
 			case '*': /* Checksum delimiter (fall through) */
 				checksum_process = false;
 			case ',': /* Data delimiter */
 				data[data_length++] = '\0';
-				tokens[++tokens_length] = &data[data_length];
 
+				/* Buffer full: the sentence is too long to be valid
+				   NMEA, so drop it without calling the callback. All
+				   input is ignored until the next '$', which resets
+				   the parser and starts a new sentence: */
 				if (data_length >= ARRAY_SIZE(data) ||
-				    tokens_length >= ARRAY_SIZE(tokens))
-					buffer_full = 1;
+				    tokens_length + 1 >= ARRAY_SIZE(tokens)) {
+					wait_for_start = true;
+					break;
+				}
+
+				tokens[++tokens_length] = &data[data_length];
 				break;
 			default:
 				data[data_length++] = *buffer;
+				/* Buffer full: drop the sentence, as above: */
 				if (data_length >= ARRAY_SIZE(data))
-					buffer_full = true;
+					wait_for_start = true;
 				break;
 		}
 
 		if (checksum_process && *buffer != '$') {
 			checksum ^= *buffer;
 		}
-
-		buffer++;
-		buffer_size--;
 	}
 }
